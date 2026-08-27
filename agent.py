@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - exercised on minimal agent installs
 
 for _name, _value in {
     "AITOGY_CONTROL_URL": "https://connect.aitogy.com",
-    "AITOGY_MQTT_HOST": "aitogy.asia",
+    "AITOGY_MQTT_HOST": "mqtt.aitogy.asia",
     "AITOGY_MQTT_PORT": "8883",
     "AITOGY_MQTT_TLS": "true",
     "AITOGY_MQTT_USERNAME": "mqttUser",
@@ -352,6 +352,7 @@ class Agent:
             int(os.getenv("AITOGY_TURN_TTL_SECONDS", "3600")),
         )
         self._mqtt = mqtt.Client(client_id=f"agent-{self.device_id}")
+        self._mqtt.enable_logger(logger)
         self._mqtt.reconnect_delay_set(min_delay=1, max_delay=30)
         self._mqtt.on_connect = self._on_mqtt_connect
         self._mqtt.on_disconnect = self._on_mqtt_disconnect
@@ -412,7 +413,7 @@ class Agent:
             except (NotImplementedError, RuntimeError):
                 pass
         self._mqtt.connect_async(
-            os.getenv("AITOGY_MQTT_HOST", "aitogy.asia"),
+            os.getenv("AITOGY_MQTT_HOST", "mqtt.aitogy.asia"),
             int(os.getenv("AITOGY_MQTT_PORT", "8883")),
             60,
         )
