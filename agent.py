@@ -69,6 +69,11 @@ def _default_device_id() -> str:
     return f"aitogy-{hostname.lower() or 'linux-agent'}"
 
 
+def _state_dir() -> Path:
+    default = Path("/var/lib/agent_connect") if os.name != "nt" else Path(".agent-connect")
+    return Path(os.getenv("AITOGY_STATE_DIR", str(default)))
+
+
 class CommandJournal:
     """Small durable dedupe journal for QoS1/WSS redelivery after restart."""
 
@@ -308,21 +313,25 @@ class Agent:
     def __init__(self) -> None:
         if mqtt is None or websockets is None:
             raise RuntimeError("Install requirements.txt before starting the agent")
-        self.device_id = os.getenv("AITOGY_DEVICE_ID") or _default_device_id()
+        self.state_dir = _state_dir()
+        self.state_path = self.state_dir / "agent.json"
+        self.token_path = self.state_dir / "device.token"
+        self._state = self._load_state()
+        self.device_id = os.getenv("AITOGY_DEVICE_ID") or self._state.get("device_id") or _default_device_id()
+        self.device_name = str(self._state.get("name") or "").strip()
+        self.device_token = str(self._state.get("device_token") or "").strip()
+        self.provisioned = bool(self._state.get("provisioned") and self.device_token)
         self.topic_prefix = os.getenv("AITOGY_MQTT_TOPIC_PREFIX", "aitogy/devices")
         self.mqtt_connected = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop = asyncio.Event()
         self._signal_transport = contextvars.ContextVar("signal_transport", default=None)
-        default_journal = (
-            "/var/lib/edge-agent/commands.json"
-            if os.name != "nt"
-            else ".agent-command-journal.json"
-        )
+        default_journal = self.state_dir / "commands.json"
         self._journal = CommandJournal(
             Path(os.getenv("AITOGY_COMMAND_JOURNAL", default_journal))
         )
-        self._ws = AitogyWebSocketControl(self._ws_url(), self._handle_ws_message)
+        self._ws: AitogyWebSocketControl | None = None
+        self._ws_task: asyncio.Task | None = None
         self._shells: dict[str, asyncio.subprocess.Process] = {}
         self._shell_readers: dict[str, asyncio.Task] = {}
         self._webrtc = WebRtcPeerManager(
@@ -353,7 +362,39 @@ class Agent:
         if _env_bool("AITOGY_MQTT_TLS", True):
             self._mqtt.tls_set(ca_certs=os.getenv("AITOGY_MQTT_CA_FILE") or None)
 
+    def _load_state(self) -> dict:
+        try:
+            loaded = json.loads(self.state_path.read_text(encoding="utf-8"))
+            return loaded if isinstance(loaded, dict) else {}
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return {}
+
+    def _save_state(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "device_id": self.device_id,
+            "name": self.device_name,
+            "provisioned": self.provisioned,
+            "device_token": self.device_token,
+        }
+        temporary = self.state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(temporary, self.state_path)
+        if os.name == "posix":
+            self.state_path.chmod(0o600)
+            if self.device_token:
+                self.token_path.write_text(self.device_token, encoding="utf-8")
+                self.token_path.chmod(0o600)
+
+    def _start_websocket(self) -> None:
+        if not self._loop or self._ws_task or not self.device_token:
+            return
+        self._ws = AitogyWebSocketControl(self._ws_url(), self._handle_ws_message)
+        self._ws_task = asyncio.create_task(self._ws.run())
+
     def _ws_url(self) -> str:
+        if not self.device_token:
+            return ""
         configured = os.getenv("AITOGY_AGENT_WS_URL", "").rstrip("/")
         if configured:
             base = configured
@@ -361,15 +402,7 @@ class Agent:
             base = os.getenv("AITOGY_CONTROL_URL", "https://connect.aitogy.com").rstrip("/")
             base = base.replace("https://", "wss://").replace("http://", "ws://")
             base += "/ws/agent"
-        token_secret = os.getenv("AITOGY_AGENT_WS_SECRET", "")
-        token = (
-            hmac.new(
-                token_secret.encode(), self.device_id.encode(), hashlib.sha256
-            ).hexdigest()
-            if token_secret
-            else ""
-        )
-        return f"{base}/{quote(self.device_id, safe='')}?token={quote(token)}"
+        return f"{base}/{quote(self.device_id, safe='')}?token={quote(self.device_token, safe='')}"
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -384,19 +417,20 @@ class Agent:
             60,
         )
         self._mqtt.loop_start()
-        ws_task = asyncio.create_task(self._ws.run())
+        self._start_websocket()
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        await self._ws.send({"type": "hello", "payload": self._inventory()})
         try:
             await self._stop.wait()
         finally:
-            ws_task.cancel()
+            if self._ws_task:
+                self._ws_task.cancel()
             heartbeat_task.cancel()
-            await asyncio.gather(ws_task, heartbeat_task, return_exceptions=True)
+            await asyncio.gather(self._ws_task, heartbeat_task, return_exceptions=True)
             await self._webrtc.close()
             for session_id in list(self._shells):
                 await self._close_shell(session_id)
-            await self._ws.close()
+            if self._ws:
+                await self._ws.close()
             self._mqtt.loop_stop()
             self._mqtt.disconnect()
 
@@ -405,17 +439,27 @@ class Agent:
             message = {"type": "heartbeat", "payload": self._inventory()}
             if self.mqtt_connected:
                 self._publish_event(message)
-            if self._ws.connected:
+            if self._ws and self._ws.connected:
                 await self._ws.send(message)
             await asyncio.sleep(30)
 
     def _inventory(self) -> dict:
+        token_fingerprint = (
+            hashlib.sha256(self.device_token.encode()).hexdigest()[:16]
+            if self.device_token
+            else None
+        )
         return {
+            "device_id": self.device_id,
+            "name": self.device_name,
             "hostname": socket.gethostname(),
             "platform": platform.system().lower(),
             "architecture": platform.machine(),
             "agent_version": os.getenv("AITOGY_AGENT_VERSION", "1.0.0"),
             "capabilities": {"webrtc": True, "shell": True, "screen": False},
+            "status": "online" if self.provisioned else "unprovisioned",
+            "provisioned": self.provisioned,
+            "token_fingerprint": token_fingerprint,
             "sent_at": int(time.time()),
         }
 
@@ -490,7 +534,10 @@ class Agent:
         client.subscribe(f"{self.topic_prefix}/{self.device_id}/commands", qos=1)
         client.subscribe(f"{self.topic_prefix}/{self.device_id}/signals", qos=1)
         self._publish_event({"type": "hello", "payload": self._inventory()})
-        logger.info("MQTT connected; WSS remains available as fallback/signaling path")
+        logger.info(
+            "MQTT connected; %s",
+            "WSS fallback is available" if self.provisioned else "awaiting UI provisioning",
+        )
 
     def _on_mqtt_disconnect(self, client, userdata, return_code, *extra) -> None:
         self.mqtt_connected = False
@@ -534,7 +581,27 @@ class Agent:
             return
         command_type = message.get("command_type", "")
         payload = message.get("payload") or {}
-        if command_type in {"agent.info", "system.info"}:
+        if command_type in {"device.provision", "provision_device"}:
+            name = str(payload.get("name") or "").strip()
+            token = str(payload.get("device_token") or payload.get("token") or "").strip()
+            if not name or len(token) < 32:
+                result = {"ok": False, "error": "name and device token are required"}
+            else:
+                self.device_name = name[:160]
+                self.device_token = token
+                self.provisioned = True
+                self._save_state()
+                self._start_websocket()
+                result = {"ok": True, "name": self.device_name, "provisioned": True}
+        elif command_type == "device.rename":
+            name = str(payload.get("name") or "").strip()
+            if not self.provisioned or not name:
+                result = {"ok": False, "error": "device is not provisioned"}
+            else:
+                self.device_name = name[:160]
+                self._save_state()
+                result = {"ok": True, "name": self.device_name}
+        elif command_type in {"agent.info", "system.info"}:
             result = {"ok": True, **self._inventory()}
         elif command_type == "webrtc.signal":
             await self._handle_signal(payload, transport)
@@ -551,11 +618,11 @@ class Agent:
         response = {"type": "result", "command_id": command_id, "payload": result}
         if preferred_transport == "mqtt" and self.mqtt_connected:
             self._publish_event(response)
-        elif preferred_transport == "websocket" and self._ws.connected:
+        elif preferred_transport == "websocket" and self._ws and self._ws.connected:
             await self._ws.send(response)
         elif self.mqtt_connected:
             self._publish_event(response)
-        else:
+        elif self._ws:
             await self._ws.send(response)
 
     async def _send_signal(self, payload: dict) -> None:
@@ -563,11 +630,11 @@ class Agent:
         preferred_transport = self._signal_transport.get()
         if preferred_transport == "mqtt" and self.mqtt_connected:
             self._publish_event(message)
-        elif preferred_transport == "websocket" and self._ws.connected:
+        elif preferred_transport == "websocket" and self._ws and self._ws.connected:
             await self._ws.send(message)
         elif self.mqtt_connected:
             self._publish_event(message)
-        else:
+        elif self._ws:
             await self._ws.send(message)
 
     def _publish_event(self, message: dict) -> None:
