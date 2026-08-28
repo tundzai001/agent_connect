@@ -12,11 +12,14 @@ import os
 import platform
 import signal
 import socket
+import shutil
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 if os.name == "posix":
     import fcntl
@@ -56,9 +59,32 @@ for _name, _value in {
 logging.basicConfig(level=os.getenv("AITOGY_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("agent")
 
+_ARM_CPU_MODELS = {
+    ("0x41", "0xd03"): "Cortex-A53",
+    ("0x41", "0xd08"): "Cortex-A72",
+    ("0x41", "0xd0b"): "Cortex-A76",
+}
+_RPI_SOC_CPU_MODELS = {"bcm2711": "Cortex-A72", "bcm2712": "Cortex-A76"}
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     return os.getenv(name, str(default)).lower() in {"1", "true", "yes", "on"}
+
+
+def _canonical_command(command: dict) -> bytes:
+    fields = {
+        key: command.get(key)
+        for key in ("command_id", "device_id", "command_type", "payload", "issued_at", "expires_at")
+    }
+    return json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def _verify_command(command: dict, key: str) -> bool:
+    signature = str(command.get("signature") or "")
+    if not key or not signature:
+        return False
+    expected = hmac.new(key.encode("utf-8"), _canonical_command(command), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, expected)
 
 
 def _default_device_id() -> str:
@@ -79,6 +105,104 @@ def _default_device_id() -> str:
 def _state_dir() -> Path:
     default = Path("/var/lib/agent_connect") if os.name != "nt" else Path(".agent-connect")
     return Path(os.getenv("AITOGY_STATE_DIR", str(default)))
+
+
+def _read_text(path: str, maximum: int = 8192) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")[:maximum].strip()
+    except OSError:
+        return ""
+
+
+def _write_secret(path: Path, value: str) -> None:
+    """Persist one credential outside the human-readable agent state."""
+    if not value:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(value, encoding="utf-8")
+    if os.name == "posix":
+        temporary.chmod(0o600)
+    os.replace(temporary, path)
+    if os.name == "posix":
+        path.chmod(0o600)
+
+
+def _cpuinfo_value(*names: str) -> str:
+    wanted = {name.lower() for name in names}
+    for line in _read_text("/proc/cpuinfo", 32768).splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().lower() in wanted and value.strip():
+            candidate = value.strip()
+            if not candidate.isdecimal():
+                return candidate
+    return ""
+
+
+def _cpu_model() -> str:
+    fields: dict[str, str] = {}
+    for line in _read_text("/proc/cpuinfo", 32768).splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            fields[key.strip().lower()] = value.strip()
+    model_name = fields.get("model name") or fields.get("processor")
+    if model_name and not model_name.isdecimal():
+        return model_name
+    implementer = fields.get("cpu implementer", "").lower()
+    part = fields.get("cpu part", "").lower()
+    if (implementer, part) in _ARM_CPU_MODELS:
+        return _ARM_CPU_MODELS[(implementer, part)]
+    hardware = fields.get("hardware", "").lower()
+    return _RPI_SOC_CPU_MODELS.get(hardware, hardware or "")
+
+
+def _os_release() -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in _read_text("/etc/os-release", 8192).splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key and value:
+            result[key.strip()] = value.strip().strip('"').strip("'")
+    return result
+
+
+def _hardware_inventory(device_id: str) -> dict[str, object]:
+    memory_total = None
+    for line in _read_text("/proc/meminfo", 8192).splitlines():
+        key, separator, value = line.partition(":")
+        if key.strip() == "MemTotal" and separator:
+            try:
+                memory_total = int(value.strip().split()[0]) * 1024
+            except (IndexError, ValueError):
+                pass
+            break
+    os_release = _os_release()
+    serial = _cpuinfo_value("Serial")
+    model = _read_text("/proc/device-tree/model") or _read_text("/sys/firmware/devicetree/base/model")
+    try:
+        disk_total = shutil.disk_usage("/").total
+    except OSError:
+        disk_total = None
+    return {
+        "device_uuid": device_id,
+        "schema_version": "1",
+        "model": model or None,
+        "serial_number": serial or None,
+        "architecture": platform.machine() or None,
+        "cpu_model": _cpu_model() or None,
+        "cpu_cores": os.cpu_count(),
+        "ram_total_bytes": memory_total,
+        "root_fs_total_bytes": disk_total,
+        "os_pretty_name": os_release.get("PRETTY_NAME"),
+        "os_id": os_release.get("ID"),
+        "os_id_like": os_release.get("ID_LIKE"),
+        "os_version": os_release.get("VERSION_ID"),
+        "kernel_version": platform.release() or None,
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 class CommandJournal:
@@ -124,13 +248,22 @@ class PtyShell:
     async def start(cls, columns: int = 120, rows: int = 32) -> "PtyShell":
         if os.name != "posix":
             raise RuntimeError("Interactive PTY shells require Linux")
-        pid, master_fd = pty.fork()
+        master_fd, slave_fd = pty.openpty()
+        pid = os.fork()
         if pid == 0:
+            os.close(master_fd)
+            os.setsid()
+            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+            for descriptor in (0, 1, 2):
+                os.dup2(slave_fd, descriptor)
+            if slave_fd > 2:
+                os.close(slave_fd)
             environment = {**os.environ, "TERM": "xterm-256color", "COLORTERM": "truecolor"}
             try:
                 os.execvpe("/bin/bash", ["/bin/bash", "-l", "-i"], environment)
             finally:
                 os._exit(127)
+        os.close(slave_fd)
         shell = cls(pid, master_fd)
         shell.resize(columns, rows)
         return shell
@@ -380,11 +513,18 @@ class Agent:
         self.state_dir = _state_dir()
         self.state_path = self.state_dir / "agent.json"
         self.token_path = self.state_dir / "device.token"
+        self.command_key_path = self.state_dir / "command.key"
         self._state = self._load_state()
         self.device_id = os.getenv("AITOGY_DEVICE_ID") or self._state.get("device_id") or _default_device_id()
         self.device_name = str(self._state.get("name") or "").strip()
-        self.device_token = str(self._state.get("device_token") or "").strip()
-        self.provisioned = bool(self._state.get("provisioned") and self.device_token)
+        legacy_token = str(self._state.get("device_token") or "").strip()
+        legacy_command_key = str(self._state.get("command_signing_key") or "").strip()
+        self.device_token = _read_text(str(self.token_path), 4096) or legacy_token
+        self.command_signing_key = _read_text(str(self.command_key_path), 4096) or legacy_command_key
+        self.provisioned = bool(self.device_token and self.command_signing_key)
+        if legacy_token or legacy_command_key:
+            # Migrate older installs once; future state writes never contain secrets.
+            self._save_state()
         self.topic_prefix = os.getenv("AITOGY_MQTT_TOPIC_PREFIX", "aitogy/devices")
         self.mqtt_connected = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -436,26 +576,82 @@ class Agent:
 
     def _save_state(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        _write_secret(self.token_path, self.device_token)
+        _write_secret(self.command_key_path, self.command_signing_key)
         payload = {
             "device_id": self.device_id,
             "name": self.device_name,
-            "provisioned": self.provisioned,
-            "device_token": self.device_token,
+            "provisioned": bool(self.provisioned and self.device_token and self.command_signing_key),
         }
         temporary = self.state_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         os.replace(temporary, self.state_path)
         if os.name == "posix":
             self.state_path.chmod(0o600)
-            if self.device_token:
-                self.token_path.write_text(self.device_token, encoding="utf-8")
-                self.token_path.chmod(0o600)
+
+    def _pairing_token(self) -> str:
+        configured = os.getenv("AITOGY_PAIRING_TOKEN", "").strip()
+        if configured:
+            return configured
+        return _read_text(str(self.state_dir / "pairing.token"), 512)
+
+    def _pair_with_control_plane(self) -> bool:
+        pairing_token = self._pairing_token()
+        if not pairing_token:
+            return False
+        control_url = os.getenv("AITOGY_CONTROL_URL", "https://connect.aitogy.com").rstrip("/")
+        body = json.dumps(
+            {
+                "pairing_token": pairing_token,
+                "device_id": self.device_id,
+                "name": os.getenv("AITOGY_DEVICE_NAME", "").strip() or socket.gethostname(),
+            }
+        ).encode("utf-8")
+        request = Request(
+            f"{control_url}/api/devices/register",
+            data=body,
+            headers={"Content-Type": "application/json", "User-Agent": "aitogy-agent"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=20) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except Exception as error:  # pragma: no cover - network dependent
+            logger.warning("Pairing request failed: %s", error)
+            return False
+        device_token = str(result.get("device_token") or "").strip()
+        command_signing_key = str(result.get("command_signing_key") or "").strip()
+        if len(device_token) < 32 or not command_signing_key:
+            logger.warning("Pairing response did not include device credentials")
+            return False
+        self.device_token = device_token
+        self.command_signing_key = command_signing_key
+        self.device_name = str(result.get("name") or os.getenv("AITOGY_DEVICE_NAME", "").strip() or socket.gethostname())[:160]
+        self.provisioned = True
+        self._save_state()
+        pairing_file = self.state_dir / "pairing.token"
+        try:
+            pairing_file.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Could not remove consumed pairing token file")
+        logger.info("Agent paired as %s", self.device_name)
+        return True
 
     def _start_websocket(self) -> None:
         if not self._loop or self._ws_task or not self.device_token:
             return
         self._ws = AitogyWebSocketControl(self._ws_url(), self._handle_ws_message)
         self._ws_task = asyncio.create_task(self._ws.run())
+
+    async def _restart_websocket(self) -> None:
+        previous = self._ws
+        self._ws = None
+        self._ws_task = None
+        if previous is not None:
+            await previous.close()
+        self._start_websocket()
 
     def _ws_url(self) -> str:
         if not self.device_token:
@@ -476,6 +672,8 @@ class Agent:
                 self._loop.add_signal_handler(signum, self._stop.set)
             except (NotImplementedError, RuntimeError):
                 pass
+        if not self.provisioned:
+            await asyncio.to_thread(self._pair_with_control_plane)
         self._mqtt.connect_async(
             os.getenv("AITOGY_MQTT_HOST", "mqtt.aitogy.asia"),
             int(os.getenv("AITOGY_MQTT_PORT", "8883")),
@@ -515,6 +713,7 @@ class Agent:
             else None
         )
         return {
+            **_hardware_inventory(self.device_id),
             "device_id": self.device_id,
             "name": self.device_name,
             "hostname": socket.gethostname(),
@@ -533,6 +732,9 @@ class Agent:
             await self._handle_signal(message.get("payload") or {}, "websocket")
         elif message.get("type") == "command":
             await self._handle_command(message, "websocket")
+        elif message.get("type") == "disconnect":
+            logger.warning("Control plane revoked this agent session: %s", message.get("reason", "unknown"))
+            await self._revoke_local_credentials()
         elif message.get("type") == "tunnel_open":
             await self._open_shell(message.get("session_id", ""))
         elif message.get("type") == "tunnel_input":
@@ -543,6 +745,16 @@ class Agent:
             )
         elif message.get("type") == "tunnel_close":
             await self._close_shell(message.get("session_id", ""))
+
+    async def _revoke_local_credentials(self) -> None:
+        self.device_token = ""
+        self.command_signing_key = ""
+        self.provisioned = False
+        self._save_state()
+        await self._webrtc.close()
+        for session_id in list(self._shells):
+            await self._close_shell(session_id)
+        self._stop.set()
 
     async def _open_shell(self, session_id: str) -> None:
         if not session_id or session_id in self._shells:
@@ -571,19 +783,21 @@ class Agent:
                 chunk = await shell.read()
                 if not chunk:
                     break
-                await self._ws.send(
-                    {
-                        "type": "tunnel_output",
-                        "session_id": session_id,
-                        "data": chunk.decode("utf-8", errors="replace"),
-                    }
-                )
+                if self._ws and self._ws.connected:
+                    await self._ws.send(
+                        {
+                            "type": "tunnel_output",
+                            "session_id": session_id,
+                            "data": chunk.decode("utf-8", errors="replace"),
+                        }
+                    )
         finally:
             if self._shells.get(session_id) is shell:
                 self._shells.pop(session_id, None)
                 self._shell_readers.pop(session_id, None)
                 await shell.close()
-                await self._ws.send({"type": "tunnel_exit", "session_id": session_id})
+                if self._ws and self._ws.connected:
+                    await self._ws.send({"type": "tunnel_exit", "session_id": session_id})
 
     async def _close_shell(self, session_id: str) -> None:
         shell = self._shells.pop(session_id, None)
@@ -636,29 +850,45 @@ class Agent:
             self._signal_transport.reset(token)
 
     async def _handle_command(self, message: dict, transport: str) -> None:
+        command_type = str(message.get("command_type") or "")
+        payload = message.get("payload") or {}
+        verification_key = self.command_signing_key
+        if command_type in {"device.provision", "provision_device"}:
+            # The current device key is not available during first provisioning;
+            # the one-time token is the bootstrap signing key for this command.
+            verification_key = str(payload.get("device_token") or payload.get("token") or "").strip()
+        if not _verify_command(message, verification_key):
+            logger.warning("Rejected unsigned or invalid %s command", command_type or "unknown")
+            return
         command_id = str(message.get("command_id", ""))
         if not command_id or self._journal.seen(command_id):
             return
-        self._journal.add(command_id)
         if message.get("expires_at") and int(time.time()) >= int(message["expires_at"]):
+            self._journal.add(command_id)
             await self._send_command_result(
                 command_id, {"ok": False, "error": "command expired"}, transport
             )
             return
-        command_type = message.get("command_type", "")
-        payload = message.get("payload") or {}
+        self._journal.add(command_id)
         if command_type in {"device.provision", "provision_device"}:
             name = str(payload.get("name") or "").strip()
             token = str(payload.get("device_token") or payload.get("token") or "").strip()
-            if not name or len(token) < 32:
-                result = {"ok": False, "error": "name and device token are required"}
+            command_signing_key = str(payload.get("command_signing_key") or "").strip()
+            if not name or len(token) < 32 or not command_signing_key:
+                result = {"ok": False, "error": "name, device token and command key are required"}
             else:
                 self.device_name = name[:160]
                 self.device_token = token
+                self.command_signing_key = command_signing_key
                 self.provisioned = True
                 self._save_state()
-                self._start_websocket()
+                await self._restart_websocket()
                 result = {"ok": True, "name": self.device_name, "provisioned": True}
+        elif command_type == "device.revoke":
+            result = {"ok": True, "revoked": True}
+            await self._send_command_result(command_id, result, transport)
+            await self._revoke_local_credentials()
+            return
         elif command_type == "device.rename":
             name = str(payload.get("name") or "").strip()
             if not self.provisioned or not name:
