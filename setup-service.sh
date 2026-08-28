@@ -31,6 +31,7 @@ fi
 "$VENV_DIR/bin/python" -m pip install -r "$AGENT_DIR/requirements.txt"
 
 sudo install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" /var/lib/agent_connect
+sudo chown -R "$SERVICE_USER:$SERVICE_GROUP" /var/lib/agent_connect
 SERVICE_TMP="$(mktemp)"
 trap 'rm -f "$SERVICE_TMP"' EXIT
 cat > "$SERVICE_TMP" <<EOF
