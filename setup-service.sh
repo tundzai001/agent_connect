@@ -30,7 +30,7 @@ fi
 "$VENV_DIR/bin/python" -m pip install --upgrade pip
 "$VENV_DIR/bin/python" -m pip install -r "$AGENT_DIR/requirements.txt"
 
-sudo install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" /var/lib/edge-agent
+sudo install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" /var/lib/agent_connect
 SERVICE_TMP="$(mktemp)"
 trap 'rm -f "$SERVICE_TMP"' EXIT
 cat > "$SERVICE_TMP" <<EOF
@@ -42,6 +42,8 @@ Wants=network-online.target
 [Service]
 User=$SERVICE_USER
 Group=$SERVICE_GROUP
+StateDirectory=agent_connect
+StateDirectoryMode=0750
 WorkingDirectory=$AGENT_DIR
 ExecStart=$VENV_DIR/bin/python $AGENT_DIR/agent.py
 Restart=always
