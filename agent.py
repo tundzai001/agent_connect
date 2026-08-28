@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import contextvars
+import errno
 import hashlib
 import hmac
 import json
@@ -16,6 +17,12 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import quote
+
+if os.name == "posix":
+    import fcntl
+    import pty
+    import struct
+    import termios
 
 try:
     import paho.mqtt.client as mqtt
@@ -103,6 +110,68 @@ class CommandJournal:
 
 
 MessageHandler = Callable[[dict], Awaitable[None]]
+
+
+class PtyShell:
+    """A real Linux terminal, including job control and window resizing."""
+
+    def __init__(self, pid: int, master_fd: int) -> None:
+        self.pid = pid
+        self.master_fd = master_fd
+        self.closed = False
+
+    @classmethod
+    async def start(cls, columns: int = 120, rows: int = 32) -> "PtyShell":
+        if os.name != "posix":
+            raise RuntimeError("Interactive PTY shells require Linux")
+        pid, master_fd = pty.fork()
+        if pid == 0:
+            environment = {**os.environ, "TERM": "xterm-256color", "COLORTERM": "truecolor"}
+            try:
+                os.execvpe("/bin/bash", ["/bin/bash", "-l", "-i"], environment)
+            finally:
+                os._exit(127)
+        shell = cls(pid, master_fd)
+        shell.resize(columns, rows)
+        return shell
+
+    async def read(self) -> bytes:
+        try:
+            return await asyncio.to_thread(os.read, self.master_fd, 4096)
+        except OSError as error:
+            if self.closed or error.errno in {errno.EBADF, errno.EIO}:
+                return b""
+            raise
+
+    def write(self, data: str | bytes) -> None:
+        if self.closed:
+            return
+        raw = data.encode() if isinstance(data, str) else data
+        os.write(self.master_fd, raw[:65536])
+
+    def resize(self, columns: int, rows: int) -> None:
+        if self.closed:
+            return
+        columns = max(20, min(int(columns), 500))
+        rows = max(5, min(int(rows), 200))
+        fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            os.killpg(self.pid, signal.SIGHUP)
+        except ProcessLookupError:
+            pass
+        try:
+            os.close(self.master_fd)
+        except OSError:
+            pass
+        try:
+            await asyncio.to_thread(os.waitpid, self.pid, 0)
+        except ChildProcessError:
+            pass
 
 
 class AitogyWebSocketControl:
@@ -196,7 +265,7 @@ class WebRtcPeerManager:
         self.turn_shared_secret = turn_shared_secret
         self.turn_ttl_seconds = turn_ttl_seconds
         self._peers = set()
-        self._processes = set()
+        self._shells: set[PtyShell] = set()
 
     async def handle_signal(self, payload: dict) -> None:
         if payload.get("type") != "offer":
@@ -246,37 +315,33 @@ class WebRtcPeerManager:
         )
 
     async def _attach_shell(self, peer, channel) -> None:
-        process = await asyncio.create_subprocess_exec(
-            "/bin/bash",
-            "-l",
-            "-i",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        self._processes.add(process)
+        shell = await PtyShell.start()
+        self._shells.add(shell)
 
         @channel.on("message")
         def on_message(data) -> None:
-            if process.stdin is None:
-                return
-            raw = data.encode() if isinstance(data, str) else data
-            process.stdin.write(raw)
-            asyncio.create_task(process.stdin.drain())
+            if isinstance(data, str) and data.startswith("{"):
+                try:
+                    message = json.loads(data)
+                except json.JSONDecodeError:
+                    message = None
+                if message and message.get("type") == "resize":
+                    shell.resize(message.get("cols", 120), message.get("rows", 32))
+                    return
+                if message and message.get("type") == "input":
+                    shell.write(str(message.get("data", "")))
+                    return
+            shell.write(data)
 
         try:
             while channel.readyState == "open":
-                if process.stdout is None:
-                    break
-                chunk = await process.stdout.read(4096)
+                chunk = await shell.read()
                 if not chunk:
                     break
                 channel.send(chunk.decode("utf-8", errors="replace"))
         finally:
-            if process.returncode is None:
-                process.terminate()
-                await process.wait()
-            self._processes.discard(process)
+            await shell.close()
+            self._shells.discard(shell)
             await self._close_peer(peer)
 
     async def _wait_for_ice(self, peer) -> None:
@@ -293,9 +358,8 @@ class WebRtcPeerManager:
     async def close(self) -> None:
         for peer in list(self._peers):
             await self._close_peer(peer)
-        for process in list(self._processes):
-            if process.returncode is None:
-                process.terminate()
+        for shell in list(self._shells):
+            await shell.close()
 
     def _turn_credentials(self) -> tuple[str, str]:
         if not self.turn_shared_secret:
@@ -332,7 +396,7 @@ class Agent:
         )
         self._ws: AitogyWebSocketControl | None = None
         self._ws_task: asyncio.Task | None = None
-        self._shells: dict[str, asyncio.subprocess.Process] = {}
+        self._shells: dict[str, PtyShell] = {}
         self._shell_readers: dict[str, asyncio.Task] = {}
         self._webrtc = WebRtcPeerManager(
             self._send_signal,
@@ -351,7 +415,7 @@ class Agent:
             os.getenv("AITOGY_TURN_SHARED_SECRET", ""),
             int(os.getenv("AITOGY_TURN_TTL_SECONDS", "3600")),
         )
-        self._mqtt = mqtt.Client(client_id=f"agent-{self.device_id}")
+        self._mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"agent-{self.device_id}")
         self._mqtt.enable_logger(logger)
         self._mqtt.reconnect_delay_set(min_delay=1, max_delay=30)
         self._mqtt.on_connect = self._on_mqtt_connect
@@ -473,37 +537,38 @@ class Agent:
             await self._open_shell(message.get("session_id", ""))
         elif message.get("type") == "tunnel_input":
             self._write_shell(message.get("session_id", ""), message.get("data", ""))
+        elif message.get("type") == "tunnel_resize":
+            self._resize_shell(
+                message.get("session_id", ""), message.get("cols", 120), message.get("rows", 32)
+            )
         elif message.get("type") == "tunnel_close":
             await self._close_shell(message.get("session_id", ""))
 
     async def _open_shell(self, session_id: str) -> None:
         if not session_id or session_id in self._shells:
             return
-        process = await asyncio.create_subprocess_exec(
-            "/bin/bash",
-            "-l",
-            "-i",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        self._shells[session_id] = process
+        shell = await PtyShell.start()
+        self._shells[session_id] = shell
         self._shell_readers[session_id] = asyncio.create_task(
-            self._read_shell(session_id, process)
+            self._read_shell(session_id, shell)
         )
         await self._ws.send({"type": "tunnel_ready", "session_id": session_id})
 
     def _write_shell(self, session_id: str, data: str) -> None:
-        process = self._shells.get(session_id)
-        if process is None or process.stdin is None or not isinstance(data, str):
+        shell = self._shells.get(session_id)
+        if shell is None or not isinstance(data, str):
             return
-        process.stdin.write(data[:65536].encode())
-        asyncio.create_task(process.stdin.drain())
+        shell.write(data)
 
-    async def _read_shell(self, session_id: str, process: asyncio.subprocess.Process) -> None:
+    def _resize_shell(self, session_id: str, columns: int, rows: int) -> None:
+        shell = self._shells.get(session_id)
+        if shell is not None:
+            shell.resize(columns, rows)
+
+    async def _read_shell(self, session_id: str, shell: PtyShell) -> None:
         try:
-            while process.stdout is not None:
-                chunk = await process.stdout.read(4096)
+            while True:
+                chunk = await shell.read()
                 if not chunk:
                     break
                 await self._ws.send(
@@ -514,22 +579,22 @@ class Agent:
                     }
                 )
         finally:
-            if self._shells.get(session_id) is process:
+            if self._shells.get(session_id) is shell:
                 self._shells.pop(session_id, None)
                 self._shell_readers.pop(session_id, None)
+                await shell.close()
                 await self._ws.send({"type": "tunnel_exit", "session_id": session_id})
 
     async def _close_shell(self, session_id: str) -> None:
-        process = self._shells.pop(session_id, None)
+        shell = self._shells.pop(session_id, None)
         reader = self._shell_readers.pop(session_id, None)
         if reader is not None and reader is not asyncio.current_task():
             reader.cancel()
-        if process is not None and process.returncode is None:
-            process.terminate()
-            await process.wait()
+        if shell is not None:
+            await shell.close()
 
-    def _on_mqtt_connect(self, client, userdata, flags, return_code, *extra) -> None:
-        self.mqtt_connected = return_code == 0
+    def _on_mqtt_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
+        self.mqtt_connected = reason_code == 0
         if not self.mqtt_connected:
             return
         client.subscribe(f"{self.topic_prefix}/{self.device_id}/commands", qos=1)
@@ -540,7 +605,7 @@ class Agent:
             "WSS fallback is available" if self.provisioned else "awaiting UI provisioning",
         )
 
-    def _on_mqtt_disconnect(self, client, userdata, return_code, *extra) -> None:
+    def _on_mqtt_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None) -> None:
         self.mqtt_connected = False
         logger.warning("MQTT disconnected; WSS fallback remains active")
 
