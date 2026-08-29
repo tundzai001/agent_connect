@@ -686,7 +686,9 @@ class Agent:
         return True
 
     def _start_websocket(self) -> None:
-        if not self._loop or self._ws_task or not self.device_token:
+        # Do not retry an old token while the device is not provisioned.
+        # Provisioning writes fresh credentials and calls this method again.
+        if not self._loop or self._ws_task or not self.provisioned or not self.device_token:
             return
         self._ws = AitogyWebSocketControl(self._ws_url(), self._handle_ws_message)
         self._ws_task = asyncio.create_task(self._ws.run())
