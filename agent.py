@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import platform
+import re
 import signal
 import socket
 import shutil
@@ -59,11 +60,16 @@ for _name, _value in {
 logging.basicConfig(level=os.getenv("AITOGY_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("agent")
 
+AGENT_VERSION = "1.1.0"
+
 _ARM_CPU_MODELS = {
+    ("0x41", "0xb76"): "ARM1176JZF-S",
+    ("0x41", "0xc07"): "Cortex-A7",
     ("0x41", "0xd03"): "Cortex-A53",
     ("0x41", "0xd08"): "Cortex-A72",
     ("0x41", "0xd0b"): "Cortex-A76",
 }
+_ARM_IMPLEMENTERS = {"0x41", "0x00000041"}
 _RPI_SOC_CPU_MODELS = {"bcm2711": "Cortex-A72", "bcm2712": "Cortex-A76"}
 
 
@@ -103,7 +109,7 @@ def _default_device_id() -> str:
 
 
 def _state_dir() -> Path:
-    default = Path("/var/lib/agent_connect") if os.name != "nt" else Path(".agent-connect")
+    default = Path("/agent_connect") if os.name != "nt" else Path(".agent-connect")
     return Path(os.getenv("AITOGY_STATE_DIR", str(default)))
 
 
@@ -137,27 +143,53 @@ def _cpuinfo_value(*names: str) -> str:
     for line in _read_text("/proc/cpuinfo", 32768).splitlines():
         key, separator, value = line.partition(":")
         if separator and key.strip().lower() in wanted and value.strip():
-            candidate = value.strip()
-            if not candidate.isdecimal():
-                return candidate
+            return value.strip()
     return ""
 
 
 def _cpu_model() -> str:
-    fields: dict[str, str] = {}
+    model_name = ""
+    hardware = ""
+    processor_fallback = ""
+    cpu_implementer = ""
+    cpu_part = ""
     for line in _read_text("/proc/cpuinfo", 32768).splitlines():
         key, separator, value = line.partition(":")
-        if separator:
-            fields[key.strip().lower()] = value.strip()
-    model_name = fields.get("model name") or fields.get("processor")
-    if model_name and not model_name.isdecimal():
-        return model_name
-    implementer = fields.get("cpu implementer", "").lower()
-    part = fields.get("cpu part", "").lower()
-    if (implementer, part) in _ARM_CPU_MODELS:
-        return _ARM_CPU_MODELS[(implementer, part)]
-    hardware = fields.get("hardware", "").lower()
-    return _RPI_SOC_CPU_MODELS.get(hardware, hardware or "")
+        if not separator:
+            continue
+        key_lower = key.strip().lower()
+        candidate = value.strip()
+        if key_lower == "model name" and not model_name:
+            model_name = candidate
+        elif key_lower == "hardware" and not hardware:
+            hardware = candidate
+        elif key_lower == "cpu implementer" and not cpu_implementer:
+            cpu_implementer = candidate.lower()
+        elif key_lower == "cpu part" and not cpu_part:
+            cpu_part = candidate.lower()
+        elif (
+            key_lower == "processor"
+            and not processor_fallback
+            and candidate
+            and not candidate.isdecimal()
+        ):
+            processor_fallback = candidate
+
+    arm_part_model = (
+        _ARM_CPU_MODELS.get((cpu_implementer, cpu_part))
+        if cpu_implementer in _ARM_IMPLEMENTERS
+        else None
+    )
+    rpi_soc_model = _RPI_SOC_CPU_MODELS.get(hardware.lower())
+    generic_arm_label = re.compile(r"^armv\d+ processor rev", re.IGNORECASE)
+    return next(
+        (
+            candidate
+            for candidate in (model_name, arm_part_model, rpi_soc_model, processor_fallback)
+            if candidate and not candidate.isdecimal() and not generic_arm_label.match(candidate)
+        ),
+        "",
+    )
 
 
 def _os_release() -> dict[str, str]:
@@ -181,7 +213,20 @@ def _hardware_inventory(device_id: str) -> dict[str, object]:
             break
     os_release = _os_release()
     serial = _cpuinfo_value("Serial")
-    model = _read_text("/proc/device-tree/model") or _read_text("/sys/firmware/devicetree/base/model")
+    model = ""
+    for model_path in ("/proc/device-tree/model", "/sys/firmware/devicetree/base/model"):
+        try:
+            model = (
+                Path(model_path)
+                .read_bytes()[:1024]
+                .replace(b"\x00", b"")
+                .decode("utf-8", errors="replace")
+                .strip()
+            )
+        except OSError:
+            continue
+        if model:
+            break
     try:
         disk_total = shutil.disk_usage("/").total
     except OSError:
@@ -196,11 +241,12 @@ def _hardware_inventory(device_id: str) -> dict[str, object]:
         "cpu_cores": os.cpu_count(),
         "ram_total_bytes": memory_total,
         "root_fs_total_bytes": disk_total,
-        "os_pretty_name": os_release.get("PRETTY_NAME"),
+        "os_pretty_name": os_release.get("PRETTY_NAME") or os_release.get("NAME"),
         "os_id": os_release.get("ID"),
         "os_id_like": os_release.get("ID_LIKE"),
-        "os_version": os_release.get("VERSION_ID"),
+        "os_version": os_release.get("VERSION_ID") or os_release.get("VERSION"),
         "kernel_version": platform.release() or None,
+        "extra_json": {},
         "collected_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -719,7 +765,7 @@ class Agent:
             "hostname": socket.gethostname(),
             "platform": platform.system().lower(),
             "architecture": platform.machine(),
-            "agent_version": os.getenv("AITOGY_AGENT_VERSION", "1.0.0"),
+            "agent_version": AGENT_VERSION,
             "capabilities": {"webrtc": True, "shell": True, "screen": False},
             "status": "online" if self.provisioned else "unprovisioned",
             "provisioned": self.provisioned,
@@ -813,7 +859,12 @@ class Agent:
             return
         client.subscribe(f"{self.topic_prefix}/{self.device_id}/commands", qos=1)
         client.subscribe(f"{self.topic_prefix}/{self.device_id}/signals", qos=1)
-        self._publish_event({"type": "hello", "payload": self._inventory()})
+        inventory = self._inventory()
+        self._publish_event({"type": "hello", "payload": inventory})
+        # Keep hardware data as an explicit event as well as part of hello and
+        # heartbeat. This mirrors the main-branch inventory contract while
+        # staying on the current Aitogy `/events` transport.
+        self._publish_event({"type": "inventory", "payload": inventory})
         logger.info(
             "MQTT connected; %s",
             "WSS fallback is available" if self.provisioned else "awaiting UI provisioning",
