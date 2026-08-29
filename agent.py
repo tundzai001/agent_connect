@@ -14,6 +14,7 @@ import re
 import signal
 import socket
 import shutil
+import threading
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -60,7 +61,10 @@ for _name, _value in {
 logging.basicConfig(level=os.getenv("AITOGY_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("agent")
 
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
+HEARTBEAT_INTERVAL_SECONDS = max(
+    5, min(int(os.getenv("AITOGY_HEARTBEAT_INTERVAL_SECONDS", "30")), 300)
+)
 
 _ARM_CPU_MODELS = {
     ("0x41", "0xb76"): "ARM1176JZF-S",
@@ -249,6 +253,71 @@ def _hardware_inventory(device_id: str) -> dict[str, object]:
         "extra_json": {},
         "collected_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _cpu_times() -> tuple[int, int] | None:
+    """Return Linux aggregate CPU ticks as (total, idle)."""
+    first_line = _read_text("/proc/stat", 4096).splitlines()
+    if not first_line or not first_line[0].startswith("cpu "):
+        return None
+    try:
+        values = [int(value) for value in first_line[0].split()[1:]]
+    except ValueError:
+        return None
+    if len(values) < 4:
+        return None
+    return sum(values), values[3] + (values[4] if len(values) > 4 else 0)
+
+
+def _memory_health() -> dict[str, float | int | None]:
+    values: dict[str, int] = {}
+    for line in _read_text("/proc/meminfo", 16384).splitlines():
+        key, separator, raw_value = line.partition(":")
+        if not separator:
+            continue
+        try:
+            values[key] = int(raw_value.strip().split()[0]) * 1024
+        except (IndexError, ValueError):
+            continue
+    total = values.get("MemTotal", 0)
+    available = values.get("MemAvailable")
+    if available is None:
+        available = sum(values.get(key, 0) for key in ("MemFree", "Buffers", "Cached"))
+    used = max(0, total - available) if total else 0
+    return {
+        "total_mb": round(total / (1024**2)) if total else None,
+        "used_mb": round(used / (1024**2)) if total else None,
+        "percent": round((used / total) * 100, 1) if total else None,
+    }
+
+
+def _cpu_temperature() -> float | None:
+    thermal_root = Path("/sys/class/thermal")
+    candidates: list[tuple[int, Path]] = []
+    try:
+        zones = list(thermal_root.glob("thermal_zone*"))
+    except OSError:
+        zones = []
+    for zone in zones:
+        zone_type = _read_text(str(zone / "type"), 128).lower()
+        priority = 0 if any(name in zone_type for name in ("cpu", "soc", "x86_pkg")) else 1
+        candidates.append((priority, zone / "temp"))
+    for _, path in sorted(candidates, key=lambda item: item[0]):
+        try:
+            value = float(path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        celsius = value / 1000.0 if abs(value) >= 1000 else value
+        if -20 <= celsius <= 150:
+            return round(celsius, 1)
+    return None
+
+
+def _uptime_seconds() -> int | None:
+    try:
+        return max(0, int(float(_read_text("/proc/uptime", 256).split()[0])))
+    except (IndexError, ValueError):
+        return None
 
 
 class CommandJournal:
@@ -584,6 +653,10 @@ class Agent:
         self._ws_task: asyncio.Task | None = None
         self._shells: dict[str, PtyShell] = {}
         self._shell_readers: dict[str, asyncio.Task] = {}
+        self._health_lock = threading.Lock()
+        self._health_cache: dict[str, object] = {}
+        self._health_cached_at = 0.0
+        self._previous_cpu_times: tuple[int, int] | None = None
         self._webrtc = WebRtcPeerManager(
             self._send_signal,
             [
@@ -752,7 +825,46 @@ class Agent:
                 self._publish_event(message)
             if self._ws and self._ws.connected:
                 await self._ws.send(message)
-            await asyncio.sleep(30)
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+    def _system_health(self) -> dict[str, object]:
+        """Collect one coherent live sample for both control transports."""
+        now = time.monotonic()
+        with self._health_lock:
+            if self._health_cache and now - self._health_cached_at < 5:
+                return dict(self._health_cache)
+
+            cpu_percent: float | None = None
+            current_cpu_times = _cpu_times()
+            if current_cpu_times and self._previous_cpu_times:
+                total_delta = current_cpu_times[0] - self._previous_cpu_times[0]
+                idle_delta = current_cpu_times[1] - self._previous_cpu_times[1]
+                if total_delta > 0:
+                    cpu_percent = round(
+                        max(0.0, min(100.0, (1 - idle_delta / total_delta) * 100)),
+                        1,
+                    )
+            if current_cpu_times:
+                self._previous_cpu_times = current_cpu_times
+            if cpu_percent is None:
+                try:
+                    cpu_percent = round(
+                        max(0.0, min(100.0, os.getloadavg()[0] / max(1, os.cpu_count() or 1) * 100)),
+                        1,
+                    )
+                except (AttributeError, OSError):
+                    pass
+
+            sample: dict[str, object] = {
+                "cpu": {"usage_percent": cpu_percent, "count": os.cpu_count()},
+                "memory": _memory_health(),
+                "temperature": {"celsius": _cpu_temperature()},
+                "uptime_seconds": _uptime_seconds(),
+                "timestamp": int(time.time()),
+            }
+            self._health_cache = sample
+            self._health_cached_at = now
+            return dict(sample)
 
     def _inventory(self) -> dict:
         token_fingerprint = (
@@ -772,6 +884,8 @@ class Agent:
             "status": "online" if self.provisioned else "unprovisioned",
             "provisioned": self.provisioned,
             "token_fingerprint": token_fingerprint,
+            "system_info": self._system_health(),
+            "heartbeat_interval_seconds": HEARTBEAT_INTERVAL_SECONDS,
             "sent_at": int(time.time()),
         }
 
