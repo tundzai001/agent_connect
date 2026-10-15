@@ -16,12 +16,12 @@ import socket
 import shutil
 import threading
 import time
-from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 if os.name == "posix":
     import fcntl
@@ -60,7 +60,7 @@ for _name, _value in {
 logging.basicConfig(level=os.getenv("AITOGY_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("agent")
 
-AGENT_VERSION = "1.2.7"
+AGENT_VERSION = "1.2.8"
 HEARTBEAT_INTERVAL_SECONDS = max(
     5, min(int(os.getenv("AITOGY_HEARTBEAT_INTERVAL_SECONDS", "30")), 300)
 )
@@ -319,32 +319,90 @@ def _uptime_seconds() -> int | None:
         return None
 
 
+class AtomicCommitUncertain(OSError):
+    """The new generation is visible, but its directory fsync failed."""
+
+
+def _atomic_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    published = False
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            if os.name == "posix":
+                os.fchmod(stream.fileno(), 0o600)
+            json.dump(payload, stream, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        published = True
+        if os.name == "posix":
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    except OSError as error:
+        if published:
+            raise AtomicCommitUncertain("Published state requires durability confirmation") from error
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 class CommandJournal:
-    """Small durable dedupe journal for QoS1/WSS redelivery after restart."""
+    """Bounded durable command intents and results; reads legacy ID-only lists."""
 
     def __init__(self, path: Path, limit: int = 512) -> None:
         self.path = path
-        self.items: deque[str] = deque(maxlen=limit)
+        self.limit = limit
+        self.entries: dict[str, dict | None] = {}
+        self.intents: dict[str, dict] = {}
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
-            self.items.extend(str(item) for item in loaded if item)
-        except (FileNotFoundError, OSError, ValueError, TypeError):
-            pass
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as error:
+            raise RuntimeError("Command journal cannot be read safely") from error
+        if isinstance(loaded, list):
+            self.entries = {str(item): None for item in loaded[-limit:] if item}
+        elif isinstance(loaded, dict) and loaded.get("version") == 2 and isinstance(loaded.get("entries"), dict):
+            self.entries = dict(list(loaded["entries"].items())[-limit:])
+            if any(value is not None and not isinstance(value, dict) for value in self.entries.values()):
+                raise RuntimeError("Invalid command journal result")
+            intents = loaded.get("intents", {})
+            if not isinstance(intents, dict) or any(not isinstance(value, dict) for value in intents.values()):
+                raise RuntimeError("Invalid command journal intent")
+            self.intents = {key: value for key, value in intents.items() if key in self.entries}
+        else:
+            raise RuntimeError("Unknown command journal format")
 
     def seen(self, command_id: str) -> bool:
-        return command_id in self.items
+        return command_id in self.entries
 
-    def add(self, command_id: str) -> None:
-        self.items.append(command_id)
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(list(self.items)), encoding="utf-8")
-            os.replace(temporary, self.path)
-            if os.name == "posix":
-                self.path.chmod(0o600)
-        except OSError as error:  # pragma: no cover - filesystem dependent
-            logger.warning("Could not persist command journal: %s", error)
+    def result(self, command_id: str) -> dict | None:
+        return self.entries.get(command_id)
+
+    def _store(self, command_id: str, result: dict | None, intent: dict | None = None) -> None:
+        entries = {**self.entries, command_id: result}
+        entries = dict(list(entries.items())[-self.limit:])
+        intents = {key: value for key, value in self.intents.items() if key in entries}
+        if intent is not None:
+            intents[command_id] = intent
+        if result is not None:
+            intents.pop(command_id, None)
+        _atomic_json(self.path, {"version": 2, "entries": entries, "intents": intents})
+        self.entries = entries
+        self.intents = intents
+
+    def add(self, command_id: str, intent: dict | None = None) -> None:
+        if not self.seen(command_id):
+            self._store(command_id, None, intent)
+
+    def complete(self, command_id: str, result: dict) -> None:
+        if self.result(command_id) != result:
+            self._store(command_id, result)
 
 
 MessageHandler = Callable[[dict], Awaitable[None]]
@@ -424,10 +482,11 @@ class PtyShell:
 class AitogyWebSocketControl:
     """Persistent WSS control/signaling fallback for a Linux agent."""
 
-    def __init__(self, url: str, on_message: MessageHandler) -> None:
+    def __init__(self, url: str, on_message: MessageHandler, on_connected=None) -> None:
         self.url = url
         self.on_message = on_message
-        self._outbox: asyncio.Queue[dict] = asyncio.Queue()
+        self.on_connected = on_connected
+        self._outbox: asyncio.Queue[dict] = asyncio.Queue(maxsize=256)
         self._stop = asyncio.Event()
         self.connected = False
         self._socket = None
@@ -459,13 +518,18 @@ class AitogyWebSocketControl:
                     delay = 1
                     sender = asyncio.create_task(self._send_loop(socket_connection))
                     receiver = asyncio.create_task(self._receive_loop(socket_connection))
-                    done, pending = await asyncio.wait(
-                        {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    for task in pending:
-                        task.cancel()
-                    for task in done:
-                        task.result()
+                    replay = asyncio.create_task(self._announce_connected())
+                    try:
+                        done, _ = await asyncio.wait(
+                            {sender, receiver}, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        for task in done:
+                            task.result()
+                    finally:
+                        sender.cancel()
+                        receiver.cancel()
+                        replay.cancel()
+                        await asyncio.gather(sender, receiver, replay, return_exceptions=True)
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # pragma: no cover - network dependent
@@ -474,8 +538,18 @@ class AitogyWebSocketControl:
                 self.connected = False
                 self._socket = None
             if not self._stop.is_set():
-                await asyncio.sleep(delay)
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
                 delay = min(delay * 2, 30)
+
+    async def _announce_connected(self) -> None:
+        if self.on_connected is not None:
+            try:
+                await self.on_connected()
+            except Exception:
+                logger.exception("Could not replay results after WSS reconnect")
 
     async def _send_loop(self, socket_connection) -> None:
         while True:
@@ -628,21 +702,43 @@ class Agent:
         self.state_path = self.state_dir / "agent.json"
         self.token_path = self.state_dir / "device.token"
         self.command_key_path = self.state_dir / "command.key"
+        self.credentials_path = self.state_dir / "credentials.json"
         self._state = self._load_state()
-        self.device_id = os.getenv("AITOGY_DEVICE_ID") or self._state.get("device_id") or _default_device_id()
-        self.device_name = str(self._state.get("name") or "").strip()
-        legacy_token = str(self._state.get("device_token") or "").strip()
-        legacy_command_key = str(self._state.get("command_signing_key") or "").strip()
-        self.device_token = _read_text(str(self.token_path), 4096) or legacy_token
-        self.command_signing_key = _read_text(str(self.command_key_path), 4096) or legacy_command_key
-        self.provisioned = bool(self.device_token and self.command_signing_key)
-        if legacy_token or legacy_command_key:
-            # Migrate older installs once; future state writes never contain secrets.
-            self._save_state()
+        if self.credentials_path.exists():
+            try:
+                credentials = json.loads(self.credentials_path.read_text(encoding="utf-8"))
+                required = ("device_id", "name", "device_token", "command_signing_key")
+                if not isinstance(credentials, dict) or any(not isinstance(credentials.get(key), str) for key in required):
+                    raise ValueError("invalid credential bundle")
+                if bool(credentials["device_token"]) != bool(credentials["command_signing_key"]):
+                    raise ValueError("incomplete credential bundle")
+                if not credentials["device_id"] or not isinstance(credentials.get("provisioned"), bool):
+                    raise ValueError("invalid credential identity or state")
+                if credentials["provisioned"] != bool(credentials["device_token"]):
+                    raise ValueError("credential state does not match keys")
+                configured_id = os.getenv("AITOGY_DEVICE_ID")
+                if configured_id and configured_id != credentials["device_id"]:
+                    raise ValueError("configured device identity differs from credentials")
+            except (OSError, ValueError, TypeError) as error:
+                raise RuntimeError("Credential bundle cannot be read safely; refusing legacy fallback") from error
+            self.device_id = credentials["device_id"]
+            self.device_name = credentials["name"]
+            self.device_token = credentials["device_token"]
+            self.command_signing_key = credentials["command_signing_key"]
+            self.provisioned = bool(self.device_token and self.command_signing_key)
+        else:
+            self.device_id = os.getenv("AITOGY_DEVICE_ID") or self._state.get("device_id") or _default_device_id()
+            self.device_name = str(self._state.get("name") or "").strip()
+            self.device_token = _read_text(str(self.token_path), 4096) or str(self._state.get("device_token") or "").strip()
+            self.command_signing_key = _read_text(str(self.command_key_path), 4096) or str(self._state.get("command_signing_key") or "").strip()
+            self.provisioned = bool(self.device_token and self.command_signing_key)
+            if self.provisioned:
+                self._save_state()
         self.topic_prefix = os.getenv("AITOGY_MQTT_TOPIC_PREFIX", "aitogy/devices")
         self.mqtt_connected = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop = asyncio.Event()
+        self._command_lock = asyncio.Lock()
         self._signal_transport = contextvars.ContextVar("signal_transport", default=None)
         default_journal = self.state_dir / "commands.json"
         self._journal = CommandJournal(
@@ -674,6 +770,7 @@ class Agent:
             int(os.getenv("AITOGY_TURN_TTL_SECONDS", "3600")),
         )
         self._mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"agent-{self.device_id}")
+        self._mqtt.max_queued_messages_set(256)
         self._mqtt.enable_logger(logger)
         self._mqtt.reconnect_delay_set(min_delay=1, max_delay=30)
         self._mqtt.on_connect = self._on_mqtt_connect
@@ -693,19 +790,22 @@ class Agent:
             return {}
 
     def _save_state(self) -> None:
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        _write_secret(self.token_path, self.device_token)
-        _write_secret(self.command_key_path, self.command_signing_key)
         payload = {
-            "device_id": self.device_id,
-            "name": self.device_name,
+            "device_id": self.device_id, "name": self.device_name,
             "provisioned": bool(self.provisioned and self.device_token and self.command_signing_key),
         }
-        temporary = self.state_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        os.replace(temporary, self.state_path)
-        if os.name == "posix":
-            self.state_path.chmod(0o600)
+        # One authoritative commit includes identity, name, and both credentials.
+        _atomic_json(self.credentials_path, {
+            **payload, "device_token": self.device_token,
+            "command_signing_key": self.command_signing_key,
+        })
+        try:
+            # Compatibility mirrors are not read when credentials.json exists.
+            _write_secret(self.token_path, self.device_token)
+            _write_secret(self.command_key_path, self.command_signing_key)
+            _atomic_json(self.state_path, payload)
+        except OSError:
+            logger.warning("Credential bundle committed; compatibility mirrors could not be updated")
 
     def _pairing_token(self) -> str:
         configured = os.getenv("AITOGY_PAIRING_TOKEN", "").strip()
@@ -734,19 +834,40 @@ class Agent:
         try:
             with urlopen(request, timeout=20) as response:
                 result = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            self._pairing_rejected = error.code in {400, 401, 403, 404, 410}
+            if error.code == 409:
+                try:
+                    detail = json.loads(error.read(2048)).get("detail")
+                except (OSError, ValueError, AttributeError):
+                    detail = None
+                self._pairing_rejected = detail != "another activation is already in progress"
+            error.close()
+            logger.warning("Pairing rejected (HTTP %s); %s", error.code,
+                "create a new pairing token" if self._pairing_rejected else "request will be retried")
+            return False
         except Exception as error:  # pragma: no cover - network dependent
             logger.warning("Pairing request failed: %s", error)
+            return False
+        if not isinstance(result, dict):
+            logger.warning("Invalid pairing response")
             return False
         device_token = str(result.get("device_token") or "").strip()
         command_signing_key = str(result.get("command_signing_key") or "").strip()
         if len(device_token) < 32 or not command_signing_key:
             logger.warning("Pairing response did not include device credentials")
             return False
+        previous_state = (self.device_name, self.device_token, self.command_signing_key, self.provisioned)
         self.device_token = device_token
         self.command_signing_key = command_signing_key
         self.device_name = str(result.get("name") or os.getenv("AITOGY_DEVICE_NAME", "").strip() or socket.gethostname())[:160]
         self.provisioned = True
-        self._save_state()
+        try:
+            self._save_state()
+        except OSError:
+            self.device_name, self.device_token, self.command_signing_key, self.provisioned = previous_state
+            logger.exception("Pairing credentials could not be committed; request will be retried")
+            return False
         pairing_file = self.state_dir / "pairing.token"
         try:
             pairing_file.unlink()
@@ -757,21 +878,40 @@ class Agent:
         logger.info("Agent paired as %s", self.device_name)
         return True
 
+    async def _pairing_loop(self) -> None:
+        while not self._stop.is_set() and not self.provisioned:
+            if self._pairing_token():
+                async with self._command_lock:
+                    if not self.provisioned and await asyncio.to_thread(self._pair_with_control_plane):
+                        self._start_websocket()
+                        return
+                    if getattr(self, "_pairing_rejected", False):
+                        return
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass
+
     def _start_websocket(self) -> None:
         # An old token can remain on disk after the server has reset/revoked a
         # device. Do not hammer the endpoint with guaranteed 403s until the
         # device is provisioned again; provisioning calls this method again.
         if not self._loop or self._ws_task or not self.provisioned or not self.device_token:
             return
-        self._ws = AitogyWebSocketControl(self._ws_url(), self._handle_ws_message)
+        self._ws = AitogyWebSocketControl(self._ws_url(), self._handle_ws_message,
+            lambda: self._replay_results("websocket"))
         self._ws_task = asyncio.create_task(self._ws.run())
 
     async def _restart_websocket(self) -> None:
         previous = self._ws
+        previous_task = self._ws_task
         self._ws = None
         self._ws_task = None
         if previous is not None:
             await previous.close()
+        if previous_task is not None:
+            previous_task.cancel()
+            await asyncio.gather(previous_task, return_exceptions=True)
         self._start_websocket()
 
     def _ws_url(self) -> str:
@@ -793,8 +933,6 @@ class Agent:
                 self._loop.add_signal_handler(signum, self._stop.set)
             except (NotImplementedError, RuntimeError):
                 pass
-        if not self.provisioned:
-            await asyncio.to_thread(self._pair_with_control_plane)
         self._mqtt.connect_async(
             os.getenv("AITOGY_MQTT_HOST", "aitogy.asia"),
             int(os.getenv("AITOGY_MQTT_PORT", "1883")),
@@ -802,14 +940,15 @@ class Agent:
         )
         self._mqtt.loop_start()
         self._start_websocket()
+        pairing_task = asyncio.create_task(self._pairing_loop()) if not self.provisioned else None
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         try:
             await self._stop.wait()
         finally:
-            if self._ws_task:
-                self._ws_task.cancel()
-            heartbeat_task.cancel()
-            await asyncio.gather(self._ws_task, heartbeat_task, return_exceptions=True)
+            tasks = [task for task in (self._ws_task, heartbeat_task, pairing_task) if task is not None]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             await self._webrtc.close()
             for session_id in list(self._shells):
                 await self._close_shell(session_id)
@@ -895,6 +1034,11 @@ class Agent:
         elif message.get("type") == "command":
             await self._handle_command(message, "websocket")
         elif message.get("type") == "disconnect":
+            if message.get("reason") == "replaced":
+                # Another connection owns this identity; replacement is not revocation.
+                logger.warning("Agent connection replaced; stopping without deleting credentials")
+                self._stop.set()
+                return
             logger.warning("Control plane revoked this agent session: %s", message.get("reason", "unknown"))
             await self._revoke_local_credentials()
         elif message.get("type") == "tunnel_open":
@@ -912,7 +1056,10 @@ class Agent:
         self.device_token = ""
         self.command_signing_key = ""
         self.provisioned = False
-        self._save_state()
+        try:
+            self._save_state()
+        except OSError:
+            logger.exception("Could not clear credentials on disk; agent is stopping")
         await self._webrtc.close()
         for session_id in list(self._shells):
             await self._close_shell(session_id)
@@ -975,6 +1122,9 @@ class Agent:
             return
         client.subscribe(f"{self.topic_prefix}/{self.device_id}/commands", qos=1)
         client.subscribe(f"{self.topic_prefix}/{self.device_id}/signals", qos=1)
+        if self._loop is not None and not self._loop.is_closed():
+            future = asyncio.run_coroutine_threadsafe(self._replay_results("mqtt"), self._loop)
+            future.add_done_callback(self._observe_transport_callback)
         inventory = self._inventory()
         self._publish_event({"type": "hello", "payload": inventory})
         # Keep hardware data as an explicit event as well as part of hello and
@@ -996,10 +1146,23 @@ class Agent:
         except (UnicodeDecodeError, json.JSONDecodeError):
             logger.warning("Ignoring malformed MQTT message")
             return
-        if self._loop is not None:
-            asyncio.run_coroutine_threadsafe(
+        if not isinstance(payload, dict) or not isinstance(payload.get("payload", {}), dict):
+            logger.warning("Ignoring MQTT message with invalid envelope")
+            return
+        if self._loop is not None and not self._loop.is_closed():
+            future = asyncio.run_coroutine_threadsafe(
                 self._handle_transport_message(payload), self._loop
             )
+            future.add_done_callback(self._observe_transport_callback)
+
+    @staticmethod
+    def _observe_transport_callback(future) -> None:
+        if future.cancelled():
+            return
+        try:
+            future.result()
+        except Exception:
+            logger.exception("Agent command handling failed")
 
     async def _handle_transport_message(self, message: dict) -> None:
         if message.get("device_id") not in {None, self.device_id}:
@@ -1017,6 +1180,21 @@ class Agent:
             self._signal_transport.reset(token)
 
     async def _handle_command(self, message: dict, transport: str) -> None:
+        if not hasattr(self, "_command_lock"):
+            self._command_lock = asyncio.Lock()
+        async with self._command_lock:
+            try:
+                await self._execute_command(message, transport)
+            except OSError:
+                logger.exception("Command journal write failed; preserving recovery intent")
+                command_id = str(message.get("command_id", ""))
+                # A committed intent may already have changed state. Do not emit a
+                # false failure that would prevent recovery of its actual result.
+                if not self._journal.seen(command_id):
+                    await self._transmit_command_result(command_id,
+                        {"ok": False, "error": "command storage unavailable"}, transport)
+
+    async def _execute_command(self, message: dict, transport: str) -> None:
         command_type = str(message.get("command_type") or "")
         payload = message.get("payload") or {}
         verification_key = self.command_signing_key
@@ -1028,56 +1206,106 @@ class Agent:
             logger.warning("Rejected unsigned or invalid %s command", command_type or "unknown")
             return
         command_id = str(message.get("command_id", ""))
-        if not command_id or self._journal.seen(command_id):
+        if not command_id:
+            return
+        if self._journal.seen(command_id):
+            result = self._journal.result(command_id)
+            if result is None:
+                if (command_type in {"device.provision", "provision_device"} and self.provisioned
+                        and self.device_token == payload.get("device_token")
+                        and self.command_signing_key == payload.get("command_signing_key")):
+                    result = {"ok": True, "name": self.device_name, "provisioned": True}
+                elif command_type == "device.rename" and self.device_name == payload.get("name"):
+                    result = {"ok": True, "name": self.device_name}
+                elif command_type == "device.revoke":
+                    await self._revoke_local_credentials()
+                    result = {"ok": True, "revoked": True}
+                else:
+                    result = {"ok": False, "error": "previous execution interrupted; result is unknown"}
+            if result.get("ok") and command_type in {"device.rename", "device.provision", "provision_device"} and self._journal.result(command_id) is None:
+                self._save_state()  # Confirm an interrupted generation before ACK.
+            await self._send_command_result(command_id, result, transport)
             return
         if message.get("expires_at") and int(time.time()) >= int(message["expires_at"]):
-            self._journal.add(command_id)
+            self._journal.add(command_id, message)
             await self._send_command_result(
                 command_id, {"ok": False, "error": "command expired"}, transport
             )
             return
-        self._journal.add(command_id)
-        if command_type in {"device.provision", "provision_device"}:
-            name = str(payload.get("name") or "").strip()
-            token = str(payload.get("device_token") or payload.get("token") or "").strip()
-            command_signing_key = str(payload.get("command_signing_key") or "").strip()
-            if not name or len(token) < 32 or not command_signing_key:
-                result = {"ok": False, "error": "name, device token and command key are required"}
-            else:
-                self.device_name = name[:160]
-                self.device_token = token
-                self.command_signing_key = command_signing_key
-                self.provisioned = True
-                self._save_state()
-                await self._restart_websocket()
-                result = {"ok": True, "name": self.device_name, "provisioned": True}
-        elif command_type == "device.revoke":
-            result = {"ok": True, "revoked": True}
-            await self._send_command_result(command_id, result, transport)
+        self._journal.add(command_id, message)
+        if command_type == "device.revoke":
             await self._revoke_local_credentials()
+            await self._send_command_result(command_id, {"ok": True, "revoked": True}, transport)
             return
-        elif command_type == "device.rename":
-            name = str(payload.get("name") or "").strip()
-            if not self.provisioned or not name:
-                result = {"ok": False, "error": "device is not provisioned"}
+        previous_state = (self.device_name, self.device_token, self.command_signing_key, self.provisioned)
+        try:
+            if command_type in {"device.provision", "provision_device"}:
+                name = str(payload.get("name") or "").strip()
+                token = str(payload.get("device_token") or payload.get("token") or "").strip()
+                command_signing_key = str(payload.get("command_signing_key") or "").strip()
+                if not name or len(token) < 32 or not command_signing_key:
+                    result = {"ok": False, "error": "name, device token and command key are required"}
+                else:
+                    self.device_name = name[:160]
+                    self.device_token = token
+                    self.command_signing_key = command_signing_key
+                    self.provisioned = True
+                    self._save_state()
+                    await self._restart_websocket()
+                    result = {"ok": True, "name": self.device_name, "provisioned": True}
+            elif command_type == "device.rename":
+                name = str(payload.get("name") or "").strip()
+                if not self.provisioned or not name:
+                    result = {"ok": False, "error": "device is not provisioned"}
+                else:
+                    self.device_name = name[:160]
+                    self._save_state()
+                    result = {"ok": True, "name": self.device_name}
+            elif command_type in {"agent.info", "system.info"}:
+                result = {"ok": True, **self._inventory()}
+            elif command_type == "webrtc.signal":
+                await self._handle_signal(payload, transport)
+                result = {"ok": True}
+            elif command_type == "ping":
+                result = {"ok": True, "pong": int(time.time())}
             else:
-                self.device_name = name[:160]
-                self._save_state()
-                result = {"ok": True, "name": self.device_name}
-        elif command_type in {"agent.info", "system.info"}:
-            result = {"ok": True, **self._inventory()}
-        elif command_type == "webrtc.signal":
-            await self._handle_signal(payload, transport)
-            result = {"ok": True}
-        elif command_type == "ping":
-            result = {"ok": True, "pong": int(time.time())}
-        else:
-            result = {"ok": False, "error": "unsupported command"}
+                result = {"ok": False, "error": "unsupported command"}
+        except AtomicCommitUncertain:
+            # Keep the visible generation and the pending intent; never cache a
+            # false failure after the filesystem's publication point.
+            raise
+        except OSError:
+            self.device_name, self.device_token, self.command_signing_key, self.provisioned = previous_state
+            logger.exception("Could not persist agent command state")
+            result = {"ok": False, "error": "could not persist agent state; check disk space and permissions"}
         await self._send_command_result(command_id, result, transport)
+
+    async def _replay_results(self, transport: str) -> None:
+        # Resend durable ACKs on reconnect, including after process restart.
+        for command_id, result in list(self._journal.entries.items()):
+            if transport == "mqtt" and not self.mqtt_connected:
+                break
+            if transport == "websocket" and (not self._ws or not self._ws.connected):
+                break
+            if result is None:
+                intent = self._journal.intents.get(command_id)
+                if intent is None:
+                    continue  # An old ID-only journal has no execution details.
+                if intent.get("command_type") == "device.revoke" and not self.provisioned:
+                    await self._send_command_result(command_id, {"ok": True, "revoked": True}, transport)
+                else:
+                    await self._handle_command(intent, transport)
+            else:
+                await self._transmit_command_result(command_id, result, transport)
+            await asyncio.sleep(0.02)
 
     async def _send_command_result(
         self, command_id: str, result: dict, preferred_transport: str
     ) -> None:
+        self._journal.complete(command_id, result)
+        await self._transmit_command_result(command_id, result, preferred_transport)
+
+    async def _transmit_command_result(self, command_id: str, result: dict, preferred_transport: str) -> None:
         response = {"type": "result", "command_id": command_id, "payload": result}
         if preferred_transport == "mqtt" and self.mqtt_connected:
             self._publish_event(response)
