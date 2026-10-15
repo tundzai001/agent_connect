@@ -47,11 +47,10 @@ except ImportError:  # pragma: no cover - exercised on minimal agent installs
 
 for _name, _value in {
     "AITOGY_CONTROL_URL": "https://connect.aitogy.com",
-    "AITOGY_MQTT_HOST": "mqtt.aitogy.asia",
-    "AITOGY_MQTT_PORT": "8883",
-    "AITOGY_MQTT_TLS": "true",
+    "AITOGY_MQTT_HOST": "aitogy.asia",
+    "AITOGY_MQTT_PORT": "1883",
+    "AITOGY_MQTT_TLS": "false",
     "AITOGY_MQTT_USERNAME": "mqttUser",
-    "AITOGY_MQTT_PASSWORD": "MqttPassword123$%^",
     "AITOGY_MQTT_TOPIC_PREFIX": "aitogy/devices",
     "AITOGY_STUN_URLS": "stun:aitogy.asia:3478",
     "AITOGY_TURN_URLS": "turn:aitogy.asia:3478?transport=udp,turns:aitogy.asia:5349?transport=tcp",
@@ -61,7 +60,7 @@ for _name, _value in {
 logging.basicConfig(level=os.getenv("AITOGY_LOG_LEVEL", "INFO"))
 logger = logging.getLogger("agent")
 
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.2.7"
 HEARTBEAT_INTERVAL_SECONDS = max(
     5, min(int(os.getenv("AITOGY_HEARTBEAT_INTERVAL_SECONDS", "30")), 300)
 )
@@ -683,7 +682,7 @@ class Agent:
         username = os.getenv("AITOGY_MQTT_USERNAME")
         if username:
             self._mqtt.username_pw_set(username, os.getenv("AITOGY_MQTT_PASSWORD"))
-        if _env_bool("AITOGY_MQTT_TLS", True):
+        if _env_bool("AITOGY_MQTT_TLS", False):
             self._mqtt.tls_set(ca_certs=os.getenv("AITOGY_MQTT_CA_FILE") or None)
 
     def _load_state(self) -> dict:
@@ -759,8 +758,9 @@ class Agent:
         return True
 
     def _start_websocket(self) -> None:
-        # Do not retry an old token while the device is not provisioned.
-        # Provisioning writes fresh credentials and calls this method again.
+        # An old token can remain on disk after the server has reset/revoked a
+        # device. Do not hammer the endpoint with guaranteed 403s until the
+        # device is provisioned again; provisioning calls this method again.
         if not self._loop or self._ws_task or not self.provisioned or not self.device_token:
             return
         self._ws = AitogyWebSocketControl(self._ws_url(), self._handle_ws_message)
@@ -796,8 +796,8 @@ class Agent:
         if not self.provisioned:
             await asyncio.to_thread(self._pair_with_control_plane)
         self._mqtt.connect_async(
-            os.getenv("AITOGY_MQTT_HOST", "mqtt.aitogy.asia"),
-            int(os.getenv("AITOGY_MQTT_PORT", "8883")),
+            os.getenv("AITOGY_MQTT_HOST", "aitogy.asia"),
+            int(os.getenv("AITOGY_MQTT_PORT", "1883")),
             60,
         )
         self._mqtt.loop_start()
